@@ -1,9 +1,10 @@
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor,Future
 from ai_module import mod_openai
 from db import postgresql
 from log import set_log_fn, log 
+from typing import List
 
 def stream_display(delta: str,stream_mode : bool):
     log(delta, end="", flush=True)
@@ -35,8 +36,10 @@ def main():
             continue
 
         log(f"AI> ", end="")
+        future2 = mod.get_vector(user_input,async_mode = True)
         future = mod.post(user_input, stream_fn=stream_display)
         future.result()
+        print("\nRAG Size:", len(future2.result()))
         log("\n") 
     pool.shutdown()
 

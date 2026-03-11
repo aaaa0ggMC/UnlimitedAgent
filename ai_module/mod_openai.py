@@ -3,7 +3,7 @@ from mod_base import Module as BaseModule
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel,Field
-from typing import List
+from typing import List,overload,Union,Literal
 from log import log
 
 class ModuleConfig(BaseModel):
@@ -11,6 +11,8 @@ class ModuleConfig(BaseModel):
     base_url : str
     # 选择的模型
     model    : str
+    # 嵌入式模型
+    embedding : str
     # 系统提示词
     system   : str = Field("You are a helpful assistant")
     # 是否为流式输出
@@ -38,6 +40,7 @@ class ModuleConfig(BaseModel):
     system_name : str = Field("system")
 
 class Module(BaseModule):
+    shared_namespace = "_shared_ai_openai"
     namespace = "ai_openai"
     config : ModuleConfig
     # 这些属于软件私下持有的数据
@@ -45,14 +48,67 @@ class Module(BaseModule):
     pool   : ThreadPoolExecutor
     summary_registry = None
 
+    def __init__(self,external_config,context,pool : ThreadPoolExecutor,namespace = "ai_openai"):
+        # 使用用户指定的namespace
+        self.namespace = namespace
+
+        super().__init__(context)
+
+        self.pool = pool
+        # 这里是为了截取配置的命名空间
+        self.config = ModuleConfig(**self.cfg(external_config))
+
+        if self.ctx().get("messages") is None:
+            self.ctx()["messages"] = []
+
+        # 初始化OpenAI,其他的基本上也是这个套路
+        self._setup_OpenAI()
+        # 构建系统提示词
+        if self.config.system != "":
+            self.push_message(self.config.system,"system")
+        log("OpenAI interface has been created.")
+
+    @overload
+    def get_vector(self, text: str, model=None, async_mode: Literal[True] = ...) -> Future: ...
+    @overload
+    def get_vector(self, text: str, model=None, async_mode: Literal[False] = ...) -> List[float]: ...
+    @overload
+    def get_vector(self, text: str, model=None, async_mode: bool = ...) -> Union[Future, List[float]]: ...
+    def get_vector(self, text: str, model=None, async_mode=False):
+        """
+        将文本转换为向量。
+        async_mode=True 时返回 Future，否则阻塞直到拿到结果。
+        """
+        if async_mode:
+            return self.pool.submit(self._execute_vector, text, model)
+        else:
+            return self._execute_vector(text, model)
+
+    def _execute_vector(self, text: str, model=None) -> List[float]:
+        """
+        内部执行逻辑：实际调用 OpenAI 接口
+        """
+        target_model = model or self.config.embedding
+        
+        input_text = text.replace("\n", " ")
+        try:
+            response = self.client.embeddings.create(
+                input=input_text,
+                model=target_model
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            log(f"[AI] Embedding 失败: {e}")
+            raise e
+
     def on_summary(self,fn):
         self.summary_registry = fn
     
-    def post(self,message : str,model = None,stream_fn = None) -> Future :
+    def post(self,message : str,model = None,stream_fn = None,trigger_push = True,is_json = False) -> Future :
         '''
         发送新的消息给AI
         '''
-        return self.pool.submit(self._execute_post,message,model,stream_fn)
+        return self.pool.submit(self._execute_post,message,model,stream_fn,trigger_push,is_json)
     
     def push_message(self,message : str,role : str = "",check_win = None):
         new_entry : ChatCompletionMessageParam
@@ -118,7 +174,7 @@ class Module(BaseModule):
         }
         self.ctx()["messages"][:] = [msg] if system_prompt is None else [system_prompt,msg] + remaining
 
-    def _execute_post(self,message : str,model,stream_fn):
+    def _execute_post(self,message : str,model,stream_fn,trigger_push = True,is_json = False):
         self.push_message(message,"user",False)
         
         target = self.client.chat
@@ -128,7 +184,8 @@ class Module(BaseModule):
         response = target.completions.create(
             model = self.config.model if model is None else model,
             messages = self.ctx()["messages"],
-            stream = self.config.stream_mode
+            stream = self.config.stream_mode,
+            response_format = {"type" : "json_object"} if is_json else {"type" : "text"} 
         )
 
         ret : str
@@ -137,7 +194,10 @@ class Module(BaseModule):
         else:
             ret = self._handle_full(response,stream_fn)
 
-        self.push_message(ret,"assistant")
+        if trigger_push:
+            self.push_message(ret,"assistant")
+        else:
+            self.ctx()["messages"].pop(0)
         return ret
 
     def _handle_stream(self, response,stream_fn):
@@ -169,21 +229,4 @@ class Module(BaseModule):
             api_key = self.config.api_key,
             base_url = self.config.base_url
         )
-
-    def __init__(self,external_config,context,pool : ThreadPoolExecutor):
-        super().__init__(context)
-
-        self.pool = pool
-        # 这里是为了截取配置的命名空间
-        self.config = ModuleConfig(**self.cfg(external_config))
-
-        if self.ctx().get("messages") is None:
-            self.ctx()["messages"] = []
-
-        # 初始化OpenAI,其他的基本上也是这个套路
-        self._setup_OpenAI()
-        # 构建系统提示词
-        if self.config.system != "":
-            self.push_message(self.config.system,"system")
-        log("OpenAI interface has been created.")
         
