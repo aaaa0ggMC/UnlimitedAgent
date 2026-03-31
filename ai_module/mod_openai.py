@@ -1,10 +1,14 @@
-from concurrent.futures import ThreadPoolExecutor,Future
+import tiktoken
+import base64
+import os
+from concurrent.futures import ThreadPoolExecutor, Future
 from mod_base import Module as BaseModule
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
-from pydantic import BaseModel,Field
-from typing import List,overload,Union,Literal
+from pydantic import BaseModel, Field
+from typing import List, overload, Union, Literal, Any, Optional
 from log import log
+from .base_ai_formatter import format_system_prompt
 
 class ModuleConfig(BaseModel):
     api_key  : str
@@ -58,8 +62,18 @@ class Module(BaseModule):
         # 这里是为了截取配置的命名空间
         self.config = ModuleConfig(**self.cfg(external_config))
 
+        # 仅在构建时格式化系统提示词
+        self.config.system = format_system_prompt(self.config.system)
+        self.config.summarize_prompt = format_system_prompt(self.config.summarize_prompt)
+
         if self.ctx().get("messages") is None:
             self.ctx()["messages"] = []
+            
+        # 初始化 tiktoken
+        try:
+            self.encoding = tiktoken.encoding_for_model(self.config.model)
+        except:
+            self.encoding = tiktoken.get_encoding("cl100k_base")
 
         # 初始化OpenAI,其他的基本上也是这个套路
         self._setup_OpenAI()
@@ -109,26 +123,32 @@ class Module(BaseModule):
         发送新的消息给AI
         '''
         return self.pool.submit(self._execute_post,message,model,stream_fn,trigger_push,is_json)
+
+    def post_image(self, message: str, image_path: str, model=None, stream_fn=None, trigger_push=True, is_json=False) -> Future:
+        '''
+        发送图片消息给AI
+        '''
+        return self.pool.submit(self._execute_image_post, message, image_path, model, stream_fn, trigger_push, is_json)
     
-    def push_message(self,message : str,role : str = "",check_win = None):
-        new_entry : ChatCompletionMessageParam
+    def push_message(self, content: Union[str, List[Any]], role: str = "", check_win: bool = None):
+        new_entry : Any
 
         if role == "user":
             new_entry = {
                 "role" : "user",
-                "content" : message,
+                "content" : content,
                 "name" : self.config.user_name
             }
         elif role == "assistant":
             new_entry = {
                 "role" : "assistant",
-                "content" : message,
+                "content" : content,
                 "name" : self.config.ai_name
             }
         else:
             new_entry = {
                 "role" : "system",
-                "content" : message,
+                "content" : format_system_prompt(content) if isinstance(content, str) else content,
                 "name" : self.config.system_name
             }
 
@@ -189,16 +209,97 @@ class Module(BaseModule):
         )
 
         ret : str
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
         if self.config.stream_mode:
             ret = self._handle_stream(response,stream_fn)
+            # 计算 token
+            prompt_content = ""
+            for m in self.ctx()["messages"]:
+                if isinstance(m["content"], str):
+                    prompt_content += m["content"]
+                elif isinstance(m["content"], list):
+                    for part in m["content"]:
+                        if part.get("type") == "text":
+                            prompt_content += part.get("text", "")
+
+            usage["prompt_tokens"] = len(self.encoding.encode(prompt_content))
+            usage["completion_tokens"] = len(self.encoding.encode(ret))
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
         else:
-            ret = self._handle_full(response,stream_fn)
+            ret, usage_obj = self._handle_full(response,stream_fn)
+            if usage_obj:
+                usage["prompt_tokens"] = usage_obj.prompt_tokens
+                usage["completion_tokens"] = usage_obj.completion_tokens
+                usage["total_tokens"] = usage_obj.total_tokens
 
         if trigger_push:
             self.push_message(ret,"assistant")
         else:
-            self.ctx()["messages"].pop(0)
-        return ret
+            self.ctx()["messages"].pop()
+        return ret, usage
+
+    def _execute_image_post(self, message: str, image_path: str, model: Optional[str], stream_fn: Any, trigger_push: bool = True, is_json: bool = False):
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        # 读取并转为 base64
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        # 识别 mime type
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_type = "image/jpeg"
+        if ext == ".png": mime_type = "image/png"
+        elif ext == ".gif": mime_type = "image/gif"
+        elif ext == ".webp": mime_type = "image/webp"
+
+        # 构造 content parts
+        content_parts = [
+            {"type": "text", "text": message},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{base64_image}"
+                }
+            }
+        ]
+
+        # 压入消息
+        self.push_message(content_parts, "user", False)
+
+        target = self.client.chat
+        if self.config.raw_mode == True:
+            target = target.with_raw_response
+
+        # 注意：某些模型可能不支持 vision，这里依赖用户配置正确的 model (如 gpt-4o)
+        response = target.completions.create(
+            model = self.config.model if model is None else model,
+            messages = self.ctx()["messages"],
+            stream = self.config.stream_mode,
+            response_format = {"type" : "json_object"} if is_json else {"type" : "text"} 
+        )
+
+        ret : str
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
+        if self.config.stream_mode:
+            ret = self._handle_stream(response,stream_fn)
+            usage["completion_tokens"] = len(self.encoding.encode(ret))
+            usage["total_tokens"] = usage["completion_tokens"]
+        else:
+            ret, usage_obj = self._handle_full(response,stream_fn)
+            if usage_obj:
+                usage["prompt_tokens"] = usage_obj.prompt_tokens
+                usage["completion_tokens"] = usage_obj.completion_tokens
+                usage["total_tokens"] = usage_obj.total_tokens
+
+        if trigger_push:
+            self.push_message(ret, "assistant")
+        else:
+            self.ctx()["messages"].pop()
+            
+        return ret, usage
 
     def _handle_stream(self, response,stream_fn):
         full_content = []
@@ -208,25 +309,27 @@ class Module(BaseModule):
                 continue
             delta = chunk.choices[0].delta.content
             if delta:
-                stream_fn(delta,self.config.stream_mode)
+                if stream_fn:
+                    stream_fn(delta,self.config.stream_mode)
                 full_content.append(delta)
                 if self.config.stream_write:
                     self.ctx()["stream"] = "".join(full_content)
         return "".join(full_content)
 
-    def _handle_full(self, response,stream_fn) -> str :
+    def _handle_full(self, response,stream_fn) -> tuple :
         if self.config.raw_mode:
             data = response.parse()
             self.ctx()["headers"] = dict(response.headers)
-            stream_fn(data.choices[0].message.content,self.config.stream_mode)
-            return data.choices[0].message.content
+            if stream_fn:
+                stream_fn(data.choices[0].message.content,self.config.stream_mode)
+            return data.choices[0].message.content, data.usage
         else:
-            stream_fn(response.choices[0].message.content,self.config.stream_mode)
-            return response.choices[0].message.content
+            if stream_fn:
+                stream_fn(response.choices[0].message.content,self.config.stream_mode)
+            return response.choices[0].message.content, response.usage
 
     def _setup_OpenAI(self):
         self.client = OpenAI(
             api_key = self.config.api_key,
             base_url = self.config.base_url
         )
-        

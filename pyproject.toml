@@ -5,9 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "google-genai>=1.69.0",
+    "mutagen>=1.47.0",
+    "ollama>=0.6.1",
     "openai>=2.26.0",
     "pgvector>=0.4.2",
+    "pillow>=12.1.1",
+    "prompt-toolkit>=3.0.52",
     "psycopg>=3.3.3",
     "psycopg-pool>=3.3.0",
     "pydantic>=2.12.5",
+    "pyperclip>=1.11.0",
+    "rich>=14.3.3",
+    "tiktoken>=0.12.0",
 ]
