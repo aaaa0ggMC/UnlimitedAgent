@@ -58,41 +58,66 @@ class ConfigLogic:
         return models
 
     def discover_modules(self) -> List[Dict]:
-        """扫描主配置模块"""
-        registry_map = {
-            "Shared AI": {
-                "ai_gemini": ("ai_module.mod_gemini", "_shared_ai_gemini"),
-                "ai_ollama": ("ai_module.mod_ollama", "_shared_ai_ollama"),
-                "ai_openai": ("ai_module.mod_openai", "_shared_ai_openai"),
-            },
-            "Database": {
-                "postgresql": ("db.postgresql", "_shared_db_pg"),
-            },
-            "Backends": {
-                "scanning_gemini": ("backend.scanning_gemini", "scanning_gemini"),
-                "asset_builder": ("backend.asset_builder", "asset_builder"),
-                "gemini_ocr": ("backend.gemini_ocr", "gemini_ocr"),
-            }
+        """自动扫描目录发现配置模块"""
+        directories = {
+            "Shared AI": ("ai_module", "_shared_ai"),
+            "Database": ("db", "_shared_db"),
+            "Backends": ("backend", "")
         }
         
         results = []
-        for category, modules in registry_map.items():
-            for name, (path, ns) in modules.items():
+        for category, (dir_name, ns_prefix) in directories.items():
+            dir_path = os.path.join(project_root, dir_name)
+            if not os.path.exists(dir_path): continue
+            
+            for filename in os.listdir(dir_path):
+                if not filename.endswith(".py") or filename.startswith("__") or filename.endswith("_base.py") or filename.startswith("base_"):
+                    continue
+                
+                mod_name = filename[:-3]
+                import_path = f"{dir_name}.{mod_name}"
+                
                 try:
-                    mod = importlib.import_module(path)
-                    cls = (getattr(mod, "Module", None) or getattr(mod, "DB", None) or 
-                           getattr(mod, "ScannerBackend", None) or getattr(mod, "AssetBuilder", None) or 
-                           getattr(mod, "OCRBackend", None))
-                    if cls and hasattr(cls, "get_config_model") and cls.get_config_model():
+                    mod = importlib.import_module(import_path)
+                    target_cls = None
+                    
+                    # 尝试发现合规的类
+                    potential_names = ["Module", "DB", "ScannerBackend", "AssetBuilder", "OCRBackend", "AIDJRag"]
+                    for name in potential_names:
+                        attr = getattr(mod, name, None)
+                        if attr and hasattr(attr, "get_config_model") and attr.get_config_model():
+                            target_cls = attr
+                            break
+                    
+                    if not target_cls:
+                        for attr_name in dir(mod):
+                            attr = getattr(mod, attr_name)
+                            if isinstance(attr, type) and hasattr(attr, "get_config_model") and attr.get_config_model():
+                                if attr.__module__ != "mod_base":
+                                    target_cls = attr
+                                    break
+                    
+                    if target_cls:
+                        is_backend = category == "Backends"
+                        if is_backend:
+                            ns = mod_name
+                        else:
+                            ns = getattr(target_cls, "shared_namespace", None)
+                            if not ns:
+                                clean_name = mod_name[4:] if mod_name.startswith("mod_") else mod_name
+                                ns = f"{ns_prefix}_{clean_name}"
+
                         results.append({
                             "category": category,
-                            "name": name,
+                            "name": mod_name,
                             "ns": ns,
-                            "model": cls.get_config_model(),
-                            "is_backend": category == "Backends"
+                            "model": target_cls.get_config_model(),
+                            "is_backend": is_backend
                         })
                 except:
                     pass
+        
+        results.sort(key=lambda x: (x['category'], x['name']))
         return results
 
 class EditValueModal(ModalScreen[str]):
@@ -125,15 +150,13 @@ class ConfigApp(App):
     #buttons { margin-top: 1; align: center middle; }
     DataTable { height: 1fr; border: solid $primary; }
     ListItem { padding: 1; }
-    .configured { color: $success; }
-    .empty { color: $error; }
-    .ai-field { color: $accent; }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("s", "save_config", "Save All", show=True),
         Binding("o", "toggle_override", "Toggle Override", show=True),
+        Binding("r", "reset_item", "Reset Item", show=True),
     ]
 
     def __init__(self):
@@ -171,6 +194,7 @@ class ConfigApp(App):
     def refresh_config_table(self):
         if not self.selected_module: return
         
+        from rich.text import Text
         ns = self.selected_module['ns']
         model = self.selected_module['model']
         table = self.query_one("#config_table")
@@ -181,40 +205,50 @@ class ConfigApp(App):
 
         # 1. 显示 Backend 自身的逻辑字段
         fields = model.model_fields
+        shared_ns = "_shared_backend" if self.selected_module.get("is_backend") else None
+        
         for f_name, f_info in fields.items():
-            cur_val = self.logic.config_data[ns].get(f_name, f_info.default)
-            table.add_row(f_name, str(cur_val), f_info.description or "", str(f_info.default), key=f"base:{f_name}")
+            if f_name in self.logic.config_data[ns]:
+                val, style = str(self.logic.config_data[ns][f_name]), "bold green"
+            elif shared_ns and f_name in self.logic.config_data.get(shared_ns, {}):
+                val, style = str(self.logic.config_data[shared_ns][f_name]), "yellow"
+            else:
+                val, style = str(f_info.default), "dim"
+            table.add_row(f_name, Text(val, style=style), f_info.description or "", str(f_info.default), key=f"base:{f_name}")
 
         # 2. 如果是 Backend，检测其 AI 穿透配置
         if self.selected_module.get("is_backend"):
-            # 定义该 Backend 拥有的 AI 代理列表
-            # 默认都有一个主代理 (key 为空表示从 root 读取 ai 类型)
-            ai_proxies = [("", ns)] # (sub_key, display_name)
-            
-            # 特殊逻辑：asset_builder 还有第二个名为 ollama_embed 的 AI 代理
-            if self.selected_module['name'] == "asset_builder":
+            ai_proxies = [("", ns)]
+            if self.selected_module['name'] in ("asset_builder", "aidj_rag"):
                 ai_proxies.append(("ollama_embed", "ollama_embed"))
 
             for sub_key, proxy_ns in ai_proxies:
                 self._add_ai_proxy_rows(table, ns, sub_key, proxy_ns)
 
-            # 3. 如果是 asset_builder，检测其 DB 穿透配置 (postgresql)
-            if self.selected_module['name'] == "asset_builder":
+            # 3. 检测其 DB 穿透配置 (postgresql)
+            if self.selected_module['name'] in ("asset_builder", "aidj_rag"):
                 db_ns = "db_pg"
-                db_reg = next((m for m in self.logic.registry if m['ns'] == "_shared_db_pg"), None)
+                db_reg = next((m for m in self.logic.registry if m['ns'].endswith(db_ns)), None)
                 if db_reg:
                     db_model = db_reg['model']
+                    shared_db_ns = db_reg['ns']
                     if db_ns not in self.logic.config_data[ns]:
                         self.logic.config_data[ns][db_ns] = {}
                     
                     table.add_row(f"[bold magenta]--- DB: {db_ns} ---[/]", "", "", "", key=f"divider:{db_ns}")
                     
-                    sub_override = self.logic.config_data[ns][db_ns].get("_override", False)
-                    table.add_row(f"  [magenta]{db_ns}._override[/]", str(sub_override), "Override shared DB settings", "False", key=f"sub:{db_ns}:_override")
+                    sub_ov_val = self.logic.config_data[ns][db_ns].get("_override", False)
+                    sub_ov_style = "bold green" if "_override" in self.logic.config_data[ns][db_ns] else "dim"
+                    table.add_row(f"  [magenta]{db_ns}._override[/]", Text(str(sub_ov_val), style=sub_ov_style), "Override shared DB settings", "False", key=f"sub:{db_ns}:_override")
 
                     for f_name, f_info in db_model.model_fields.items():
-                        cur_val = self.logic.config_data[ns][db_ns].get(f_name, f_info.default)
-                        table.add_row(f"  [magenta]{db_ns}.{f_name}[/]", str(cur_val), f_info.description or "", str(f_info.default), key=f"sub:{db_ns}:{f_name}")
+                        if f_name in self.logic.config_data[ns][db_ns]:
+                            val, style = str(self.logic.config_data[ns][db_ns][f_name]), "bold green"
+                        elif f_name in self.logic.config_data.get(shared_db_ns, {}):
+                            val, style = str(self.logic.config_data[shared_db_ns][f_name]), "yellow"
+                        else:
+                            val, style = str(f_info.default), "dim"
+                        table.add_row(f"  [magenta]{db_ns}.{f_name}[/]", Text(val, style=style), f_info.description or "", str(f_info.default), key=f"sub:{db_ns}:{f_name}")
         
         override = self.logic.config_data[ns].get("_override", False)
         self.query_one("#override_status").update(f"Override Shared Backend: [bold {'green' if override else 'red'}]{override}[/]")
@@ -222,33 +256,38 @@ class ConfigApp(App):
 
     def _add_ai_proxy_rows(self, table, ns, sub_key, display_name):
         """展示 AI 代理 (mod_general) 的穿透配置"""
-        # 如果 sub_key 为空，说明 AI 配置直接在 ns 根部 (如 asset_builder.ai)
-        # 如果 sub_key 有值，说明 AI 配置在 ns.sub_key 下 (如 asset_builder.ollama_embed.ai)
+        from rich.text import Text
         target_dict = self.logic.config_data[ns]
         if sub_key:
             if sub_key not in target_dict: target_dict[sub_key] = {}
             target_dict = target_dict[sub_key]
         
-        # 获取当前的 AI 类型
         ai_type = target_dict.get("ai") or self.logic.config_data.get("_shared_ai_general", {}).get("ai", "gemini")
+        ai_style = "bold green" if "ai" in target_dict else "dim"
         
         key_prefix = f"sub:{sub_key}:" if sub_key else "sub::"
         display_prefix = f"{sub_key}." if sub_key else ""
 
         table.add_row(f"[bold yellow]--- AI: {display_name} ---[/]", "", "", "", key=f"divider:{display_name}")
-        table.add_row(f"  [yellow]{display_prefix}ai[/]", ai_type, f"Select AI backend for {display_name}", "gemini", key=f"{key_prefix}ai")
+        table.add_row(f"  [yellow]{display_prefix}ai[/]", Text(ai_type, style=ai_style), f"Select AI backend for {display_name}", "gemini", key=f"{key_prefix}ai")
 
         if ai_type in self.logic.ai_models:
             ai_model = self.logic.ai_models[ai_type]
-            if ai_type not in target_dict:
-                target_dict[ai_type] = {}
+            shared_ai_ns = f"_shared_ai_{ai_type}"
+            if ai_type not in target_dict: target_dict[ai_type] = {}
             
-            sub_override = target_dict[ai_type].get("_override", False)
-            table.add_row(f"  [cyan]{display_prefix}{ai_type}._override[/]", str(sub_override), "Override shared AI settings", "False", key=f"{key_prefix}{ai_type}:_override")
+            sub_ov_val = target_dict[ai_type].get("_override", False)
+            sub_ov_style = "bold green" if "_override" in target_dict[ai_type] else "dim"
+            table.add_row(f"  [cyan]{display_prefix}{ai_type}._override[/]", Text(str(sub_ov_val), style=sub_ov_style), "Override shared AI settings", "False", key=f"{key_prefix}{ai_type}:_override")
 
             for f_name, f_info in ai_model.model_fields.items():
-                cur_val = target_dict[ai_type].get(f_name, f_info.default)
-                table.add_row(f"  [cyan]{display_prefix}{ai_type}.{f_name}[/]", str(cur_val), f_info.description or "", str(f_info.default), key=f"{key_prefix}{ai_type}:{f_name}")
+                if f_name in target_dict[ai_type]:
+                    val, style = str(target_dict[ai_type][f_name]), "bold green"
+                elif f_name in self.logic.config_data.get(shared_ai_ns, {}):
+                    val, style = str(self.logic.config_data[shared_ai_ns][f_name]), "yellow"
+                else:
+                    val, style = str(f_info.default), "dim"
+                table.add_row(f"  [cyan]{display_prefix}{ai_type}.{f_name}[/]", Text(val, style=style), f_info.description or "", str(f_info.default), key=f"{key_prefix}{ai_type}:{f_name}")
 
     @on(DataTable.RowSelected)
     def handle_row_selection(self, event: DataTable.RowSelected):
@@ -262,7 +301,6 @@ class ConfigApp(App):
             field_name = key_parts[1]
             current_val = self.logic.config_data[ns].get(field_name, "")
             model = self.selected_module['model']
-            # 特殊处理 'ai' 字段，它不在 model 里
             f_info = model.model_fields.get(field_name) if field_name != "ai" else None
             
             def check_result(new_value: str):
@@ -270,37 +308,27 @@ class ConfigApp(App):
                 self._update_val(self.logic.config_data[ns], field_name, f_info, new_value)
                 self.refresh_config_table()
                 self.refresh_module_list()
+            self.push_screen(EditValueModal(field_name, current_val), check_result)
         else:
-            # sub:sub_key:ai_type:field
-            # 或者 sub::ai_type:field
             sub_key = key_parts[1]
             target_dict = self.logic.config_data[ns]
             if sub_key: target_dict = target_dict[sub_key]
-            
-            field_path = key_parts[2:] # ['ai'] or ['gemini', 'api_key']
+            field_path = key_parts[2:]
             
             if len(field_path) == 1: 
                 field_name = field_path[0]
                 current_val = target_dict.get(field_name, "")
-
-                # If it's not 'ai' selection, it must be a direct field (like DB)
                 if field_name != "ai":
-                    # Try finding the model for this sub_key (e.g., db_pg)
                     reg_item = next((m for m in self.logic.registry if m['ns'].endswith(sub_key)), None)
                     model = reg_item['model'] if reg_item else None
                     f_info = model.model_fields.get(field_name) if model and field_name != "_override" else None
                 else:
                     f_info = None
-            else: # Editing sub-model field (AI)
-
-                ai_type = field_path[0]
-                field_name = field_path[1]
+            else:
+                ai_type, field_name = field_path[0], field_path[1]
                 current_val = target_dict[ai_type].get(field_name, "")
-                
-                model = None
-                if ai_type in self.logic.ai_models:
-                    model = self.logic.ai_models[ai_type]
-                else:
+                model = self.logic.ai_models.get(ai_type)
+                if not model:
                     reg_item = next((m for m in self.logic.registry if m['ns'].endswith(ai_type)), None)
                     if reg_item: model = reg_item['model']
                 f_info = model.model_fields.get(field_name) if model and field_name != "_override" else None
@@ -311,7 +339,6 @@ class ConfigApp(App):
                 self._update_val(target_dict, field_name, f_info, new_value)
                 self.refresh_config_table()
                 self.refresh_module_list()
-
             self.push_screen(EditValueModal(field_name, current_val), check_result)
 
     def _update_val(self, target_dict, field_name, f_info, new_value):
@@ -329,6 +356,33 @@ class ConfigApp(App):
                 else: target_dict[field_name] = new_value
         except:
             self.notify("Invalid Type", severity="error")
+
+    def action_reset_item(self):
+        """重置当前选中的配置项"""
+        table = self.query_one("#config_table")
+        if table.cursor_row is None: return
+        row_keys = list(table.rows.keys())
+        row_key = row_keys[table.cursor_row].value
+        key_parts = row_key.split(":")
+        if key_parts[0] == "divider": return
+        ns = self.selected_module['ns']
+        if key_parts[0] == "base":
+            field_name = key_parts[1]
+            if field_name in self.logic.config_data[ns]: self.logic.config_data[ns].pop(field_name)
+        else:
+            sub_key = key_parts[1]
+            target_dict = self.logic.config_data[ns]
+            if sub_key: target_dict = target_dict[sub_key]
+            field_path = key_parts[2:]
+            if len(field_path) == 1:
+                field_name = field_path[0]
+                if field_name in target_dict: target_dict.pop(field_name)
+            else:
+                ai_type, field_name = field_path[0], field_path[1]
+                if ai_type in target_dict and field_name in target_dict[ai_type]:
+                    target_dict[ai_type].pop(field_name)
+        self.refresh_config_table()
+        self.notify("Item reset to inherited/default value")
 
     def action_toggle_override(self):
         if self.selected_module:
