@@ -1,0 +1,7 @@
+{
+  "gemini_ocr": {
+    "api_key": "YOUR_GEMINI_API_KEY",
+    "model": "gemini-1.5-flash",
+    "system": "You are a specialized OCR tool. Extract and output ONLY the text from the image. Do not include any conversation, explanation, or markdown formatting."
+  }
+}

@@ -44,6 +44,7 @@ class ModuleConfig(BaseModel):
 class Module(BaseModule):
     shared_namespace = "_shared_ai_gemini"
     namespace = "ai_gemini"
+    config_model = ModuleConfig
     config: ModuleConfig
     client: genai.Client
     pool: ThreadPoolExecutor

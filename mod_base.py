@@ -4,6 +4,11 @@ class Module:
     shared_namespace = "_shared_mode_base"
     namespace = "mod_base"
     context : dict
+    config_model = None # 用于存储 Pydantic 模型类
+
+    @classmethod
+    def get_config_model(cls):
+        return cls.config_model
 
     def cfg(self, config: dict) -> dict:
         """

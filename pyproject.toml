@@ -17,5 +17,6 @@ dependencies = [
     "pydantic>=2.12.5",
     "pyperclip>=1.11.0",
     "rich>=14.3.3",
+    "textual>=8.2.1",
     "tiktoken>=0.12.0",
 ]

@@ -46,6 +46,7 @@ class ModuleConfig(BaseModel):
 class Module(BaseModule):
     shared_namespace = "_shared_ai_openai"
     namespace = "ai_openai"
+    config_model = ModuleConfig
     config : ModuleConfig
     # 这些属于软件私下持有的数据
     client : OpenAI

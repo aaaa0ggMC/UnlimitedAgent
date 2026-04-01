@@ -1,0 +1,7 @@
+{
+  "scanning_gemini": {
+    "api_key": "YOUR_GEMINI_API_KEY",
+    "model": "gemini-1.5-flash",
+    "system": "You are a specialized file scanner and summarizer."
+  }
+}

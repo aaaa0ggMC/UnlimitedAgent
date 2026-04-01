@@ -20,6 +20,7 @@ class ModuleConfig(BaseModel):
 class DB(BaseModule):
     shared_namespace = "_shared_db_pg"
     namespace = "db_pg"
+    config_model = ModuleConfig
     config = None
     context : dict
     pool : ConnectionPool
@@ -145,15 +146,28 @@ class DB(BaseModule):
 
                 # 自动创建 HNSW 向量索引
                 if vector_col_name:
-                    idx_name_hnsw = f"idx_{form}_{vector_col_name}_hnsw"
-                    create_idx_sql = sql.SQL(
-                        "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} vector_l2_ops);"
-                    ).format(
-                        sql.Identifier(idx_name_hnsw),
-                        sql.Identifier(form),
-                        sql.Identifier(vector_col_name)
-                    )
-                    cur.execute(create_idx_sql)
+                    # 检查维度，HNSW 默认限制为 2000 维
+                    dim = 0
+                    try:
+                        import re
+                        match = re.search(r'VECTOR\((\d+)\)', col_defs[vector_col_name])
+                        if match:
+                            dim = int(match.group(1))
+                    except:
+                        pass
+
+                    if dim > 0 and dim <= 2000:
+                        idx_name_hnsw = f"idx_{form}_{vector_col_name}_hnsw"
+                        create_idx_sql = sql.SQL(
+                            "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw ({} vector_l2_ops);"
+                        ).format(
+                            sql.Identifier(idx_name_hnsw),
+                            sql.Identifier(form),
+                            sql.Identifier(vector_col_name)
+                        )
+                        cur.execute(create_idx_sql)
+                    else:
+                        log(f"跳过 HNSW 索引: 维度 {dim} 超过 2000 或无法识别，将使用全表扫描。")
 
                 cur.execute(final_insert_query, insert_vals)
             conn.commit()
@@ -175,17 +189,18 @@ class DB(BaseModule):
         """提取表单数据。"""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
+                # 检查表是否存在
                 cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s);", (form,))
                 exists_row = cur.fetchone()
                 if not exists_row or not exists_row[0]:
-                    log(f"Table '{form}' does not exist.")
                     return []
 
-                # 修复 Pylance 报错：使用 sql.Composed
+                # 构建查询
                 query_components = [sql.SQL("SELECT * FROM {}").format(sql.Identifier(form))]
                 params: List[Any] = []
 
                 if pks is not None and len(pks) > 0:
+                    # 获取主键列名
                     cur.execute("""
                         SELECT a.attname
                         FROM pg_index i
@@ -193,7 +208,7 @@ class DB(BaseModule):
                         WHERE i.indrelid = %s::regclass AND i.indisprimary;
                     """, (form,))
                     pk_row = cur.fetchone()
-                    pk_col = pk_row[0] if pk_row else "id"
+                    pk_col = pk_row[0] if pk_row else "id" # 默认回退到 id
                     
                     query_components.append(sql.SQL(" WHERE {} = ANY(%s)").format(sql.Identifier(pk_col)))
                     params.append(pks)
@@ -205,7 +220,7 @@ class DB(BaseModule):
                 final_query = sql.Composed(query_components)
                 cur.execute(final_query, params)
                 
-                columns = [] if not cur.description else [ desc.name for desc in cur.description ]
+                columns = [desc.name for desc in cur.description] if cur.description else []
                 return [dict(zip(columns, row)) for row in cur.fetchall()]
 
     def find_vectors(self, form: str, vector: Vector, norm_val: int = 2, limit: int = 10, threshold: Optional[float] = None, meta_filter: Optional[Dict] = None):

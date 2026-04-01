@@ -1,0 +1,19 @@
+{
+  "asset_builder": {
+    "api_key": "YOUR_GEMINI_API_KEY",
+    "model": "gemini-1.5-flash",
+    "system": "You are a specialized asset builder and analyzer. Please analyze the provided asset and return a JSON object with 'prefered_name', 'description', and 'tags'."
+  },
+  "db_pg": {
+    "db_name": "your_db_name",
+    "user": "postgres",
+    "password": "your_password",
+    "host": "127.0.0.1",
+    "port": 5432
+  },
+  "ai_ollama": {
+    "base_url": "http://localhost:11434",
+    "model": "qwen:7b",
+    "embedding": "qwen:7b"
+  }
+}

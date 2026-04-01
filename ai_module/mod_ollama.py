@@ -42,6 +42,7 @@ class ModuleConfig(BaseModel):
 class Module(BaseModule):
     shared_namespace = "_shared_ai_ollama"
     namespace = "ai_ollama"
+    config_model = ModuleConfig
     config: ModuleConfig
     client: Client
     pool: ThreadPoolExecutor
